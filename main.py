@@ -1,144 +1,169 @@
-from flask import Flask, request, jsonify
-from news_fetcher import get_random_news_today
+from datetime import datetime, timedelta, date
+from flask     import Flask, request, jsonify
+from news_fetcher import get_random_news
 
-app = Flask(__name__)
+app      = Flask(__name__)
+MAX_LEN  = 950
 
-# ─────────────────────────────────────────────────────────────
-# Константы
-MAX_LEN = 950          # запас, чтобы итог < 1024 + « Продолжить?»
-# ─────────────────────────────────────────────────────────────
-
-# Память сессий (для демо достаточно)
 session_state: dict[str, dict] = {}
 
+# ─── helpers ───────────────────────────────────────────────
+def ok(text: str):
+    return jsonify({"response": {"text": text, "end_session": False},
+                    "version": "1.0"})
 
-# ─────────────────────────────────────────────────────────────
-# Хелперы
-def ok(text: str) -> tuple:
-    """Формирует правильный JSON-ответ для Алисы."""
-    return jsonify({
-        "response": {"text": text, "end_session": False},
-        "version": "1.0"
-    })
-
-
-def chunk_text(full: str) -> tuple[str, str]:
-    """
-    Делит текст так, чтобы первая часть ≤ MAX_LEN и заканчивалась точкой.
-    Возвращает (первая_часть, хвост).
-    """
-    if len(full) <= MAX_LEN:
-        return full.strip(), ""
-
-    cut = full[:MAX_LEN]
-    last_dot = cut.rfind(".")
-    if last_dot == -1:                      # нет точек – ищем последний пробел
-        last_dot = cut.rfind(" ")
-    head = cut[: last_dot + 1].strip()
-    tail = full[last_dot + 1:].lstrip()
+def chunk(text: str):
+    if len(text) <= MAX_LEN:
+        return text.strip(), ""
+    cut = text[:MAX_LEN]
+    end = cut.rfind(".")
+    if end == -1: end = cut.rfind(" ")
+    head = cut[:end+1].strip()
+    tail = text[end+1:].lstrip()
     return head, tail
-# ─────────────────────────────────────────────────────────────
 
+def parse_date(req) -> tuple[bool, date]:
+    """Возвращает (is_future, дата)."""
+    ent = req["request"]["nlu"].get("entities", [])
+    today = datetime.utcnow().date()
 
-# ─────────────────────────────────────────────────────────────
-# Пинг для Render (GET /)
+    for e in ent:
+        if e["type"] != "YANDEX.DATETIME":
+            continue
+        v = e["value"]
+
+        # относительный день
+        if v.get("day_is_relative"):
+            dt = today + timedelta(days=int(v["day"]))
+            return dt > today, dt
+
+        d, m, y = v.get("day"), v.get("month"), v.get("year")
+        if d and m:
+            if y is None:
+                dt = date(today.year, m, d)
+                if dt > today:          # «24 сентября» в будущем → прошлый год
+                    dt = date(today.year - 1, m, d)
+            else:
+                dt = date(y, m, d)
+            return dt > today, dt
+
+    # ни одной даты → трактуем «сегодня»
+    return False, today
+# ───────────────────────────────────────────────────────────
+
 @app.route("/", methods=["GET"])
 def ping():
     return "ok", 200
-# ─────────────────────────────────────────────────────────────
 
-
-# ─────────────────────────────────────────────────────────────
-# Основной webhook
 @app.route("/", methods=["POST"])
 def webhook():
     try:
         req = request.get_json(force=True)
-        session_id = req["session"]["session_id"]
-        is_new     = req["session"]["new"]
-        user_text  = req["request"]["original_utterance"].lower()
+        sid = req["session"]["session_id"]
+        is_new = req["session"]["new"]
+        utt = req["request"]["original_utterance"].lower().strip()
 
-        # ─── новая сессия ────────────────────────────────────
         if is_new:
-            session_state[session_id] = {"stage": "await_today"}
-            return ok("Привет! Это навык «Обычные новости». "
-                      "Скажи «сегодня», чтобы услышать свежие новости.")
+            session_state[sid] = {"stage": "await_date"}
+            return ok("Привет! Скажи «сегодня», «вчера» или дату — "
+                      "и я зачитаю новости.")
 
-        # текущее состояние
-        state = session_state.get(session_id, {"stage": "await_today"})
+        state = session_state.get(sid, {"stage": "await_date"})
         stage = state["stage"]
 
-        # ─── пользователь сказал «сегодня» ──────────────────
-        if "сегодня" in user_text and stage == "await_today":
-            news = get_random_news_today()
-            session_state[session_id] = {"stage": "detail_choice",
-                                         "last_news": news}
-            return ok(f"{news['title']} Хотите узнать подробнее?")
+        # ―── пользователь произнёс дату
+        if stage == "await_date":
+            is_future, dt = parse_date(req)
+            if is_future:
+                return ok("Мы честные, поэтому заранее новости не знаем. "
+                          "Попробуй спросить про вчера или сегодня.")
+            news = get_random_news(dt)
+            title = news["title"].rstrip(".") + "."
+            session_state[sid] = {"stage": "detail",
+                                  "news": news,
+                                  "date": dt}
+            return ok(f"{title} Хотите узнать подробнее?")
 
-        # ─── ждём «да / нет» после заголовка ────────────────
-        if stage == "detail_choice":
-            if "да" in user_text:
-                news = state["last_news"]
-                head, tail = chunk_text(news["content"])
-
+        # ―── читаем подробности
+        if stage == "detail":
+            if "да" in utt:
+                news = state["news"]
+                head, tail = chunk(news["content"])
                 if tail:
-                    session_state[session_id] = {"stage": "continue_read",
-                                                 "remaining": tail}
+                    session_state[sid] = {"stage": "continue",
+                                          "remain": tail,
+                                          "extra": news["extra"],
+                                          "date": state["date"]}
                     return ok(f"{head} Продолжить?")
-                else:
-                    session_state[session_id]["stage"] = "more_choice"
-                    return ok(f"{head} Хотите ещё одну новость за сегодня?")
+                # статья короткая
+                if news["extra"]:
+                    session_state[sid] = {"stage": "extra_offer",
+                                          "extra": news["extra"],
+                                          "date": state["date"]}
+                    return ok(f"{head} Хотите узнать и об этом?")
+                session_state[sid]["stage"] = "more"
+                return ok(f"{head} Хотите ещё новость?")
 
-            if "нет" in user_text:
-                news = get_random_news_today()
-                session_state[session_id] = {"stage": "detail_choice",
-                                             "last_news": news}
-                return ok(f"Тогда вот ещё: {news['title']} "
-                          "Хотите узнать подробнее?")
-
+            if "нет" in utt:
+                news = get_random_news(state["date"])
+                title = news["title"].rstrip(".") + "."
+                session_state[sid] = {"stage": "detail",
+                                      "news": news,
+                                      "date": state["date"]}
+                return ok(f"Тогда вот ещё: {title} Хотите узнать подробнее?")
             return ok("Скажи «да» или «нет», пожалуйста.")
 
-        # ─── продолжаем читать длинный текст ────────────────
-        if stage == "continue_read":
-            if "да" in user_text and state.get("remaining"):
-                head, tail = chunk_text(state["remaining"])
+        # ―── продолжаем длинную статью
+        if stage == "continue":
+            if "да" in utt:
+                head, tail = chunk(state["remain"])
                 if tail:
-                    session_state[session_id]["remaining"] = tail
+                    session_state[sid]["remain"] = tail
                     return ok(f"{head} Продолжить?")
-                else:
-                    session_state[session_id]["stage"] = "more_choice"
-                    return ok(f"{head} Хотите ещё одну новость за сегодня?")
-
-            if "нет" in user_text:
-                session_state[session_id]["stage"] = "more_choice"
+                if state.get("extra"):
+                    session_state[sid] = {"stage": "extra_offer",
+                                          "extra": state["extra"],
+                                          "date": state["date"]}
+                    return ok(f"{head} Хотите узнать и об этом?")
+                session_state[sid]["stage"] = "more"
+                return ok(f"{head} Хотите ещё новость?")
+            if "нет" in utt:
+                session_state[sid]["stage"] = "more"
                 return ok("Окей. Хотите следующую новость?")
-
             return ok("Скажи «да» или «нет», пожалуйста.")
 
-        # ─── после полного текста спрашиваем следующую ──────
-        if stage == "more_choice":
-            if "да" in user_text:
-                news = get_random_news_today()
-                session_state[session_id] = {"stage": "detail_choice",
-                                             "last_news": news}
-                return ok(f"{news['title']} Хотите узнать подробнее?")
-
-            if "нет" in user_text:
-                session_state[session_id]["stage"] = "await_today"
-                return ok("Хорошо. Если понадобится ещё – скажи «сегодня».")
-
+        # ―── предлагаем перейти по ссылке
+        if stage == "extra_offer":
+            if "да" in utt:
+                # читаем допматериал как отдельную новость (заглушка)
+                news = get_random_news(datetime.utcnow().date())
+                head, tail = chunk(news["content"])
+                session_state[sid]["stage"] = "more"
+                return ok(f"{news['title']}. {head} Хотите ещё новость?")
+            if "нет" in utt:
+                session_state[sid]["stage"] = "more"
+                return ok("Окей. Хотите следующую новость?")
             return ok("Скажи «да» или «нет», пожалуйста.")
 
-        # ─── fallback ───────────────────────────────────────
-        return ok("Не понял. Скажи «сегодня», чтобы услышать новости.")
+        # ―── хотим ещё новость
+        if stage == "more":
+            if "да" in utt:
+                news = get_random_news(state["date"])
+                title = news["title"].rstrip(".") + "."
+                session_state[sid] = {"stage": "detail",
+                                      "news": news,
+                                      "date": state["date"]}
+                return ok(f"{title} Хотите узнать подробнее?")
+            if "нет" in utt:
+                session_state[sid]["stage"] = "await_date"
+                return ok("Хорошо. Если захочешь ещё — задай дату.")
+            return ok("Скажи «да» или «нет», пожалуйста.")
 
+        return ok("Не понял. Попробуй ещё раз.")
     except Exception as e:
-        # Любая непойманная ошибка – не молчим, а отвечаем безопасно
-        print("HANDLER_ERROR:", e)
-        return ok("Упс, что-то сломалось. Попробуй ещё раз чуть позже.")
-# ─────────────────────────────────────────────────────────────
-
+        print("ERR:", e)
+        return ok("Кажется, что-то сломалось. Попробуйте позже.")
+# ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # локальная отладка
     app.run(host="0.0.0.0", port=5000, debug=True)
