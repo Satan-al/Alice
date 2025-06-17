@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -7,7 +6,20 @@ app = Flask(__name__)
 def webhook():
     req = request.get_json()
 
-    response_text = "Привет! Это навык 'Обычные новости'. В скором времени я буду рассказывать тебе свежие заголовки, а пока — протест связи прошёл успешно."
+    is_new_session = req["session"]["new"]
+    user_utterance = req["request"]["original_utterance"]
+
+    # Приветствие, если новая сессия
+    if is_new_session:
+        response_text = (
+            "Привет! Это навык 'Обычные новости'. "
+            "Скажи, за какой день тебе интересны новости — например, 'за сегодня', 'вчера' или конкретную дату."
+        )
+    else:
+        # Пока на любую фразу возвращаем одно и то же (заглушка)
+        response_text = (
+            "Скоро я начну зачитывать тебе свежие заголовки. Пока можешь попробовать сказать: 'новости за вчера'."
+        )
 
     return jsonify({
         "response": {
