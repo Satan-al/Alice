@@ -8,7 +8,7 @@ from pyrogram import Client
 # ── Telegram creds ──────────────────────────────────────────
 API_ID   = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
-SESSION  = "sessions/astra"
+SESSION = "/tmp/astra_session"      # <-- вместо "sessions/astra"
 CHANNEL  = "astrapress"
 os.makedirs("sessions", exist_ok=True)
 
