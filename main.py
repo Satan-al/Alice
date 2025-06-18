@@ -3,6 +3,9 @@ import re
 import random               # ← добавь эту строку
 from flask import Flask, request, jsonify
 from news_fetcher import today_news, news_by_date, news_by_keyword
+if os.getenv("CHECK_ENV", "false").lower() == "true":
+    import check_env
+    check_env.check_env()
 
 app = Flask(__name__)
 MAX_LEN = 950
