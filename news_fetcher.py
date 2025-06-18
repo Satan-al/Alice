@@ -1,117 +1,195 @@
-import feedparser, requests, io, re, random, time, datetime, json
-from datetime import datetime as dt, timezone, date
+# news_fetcher.py
+from __future__ import annotations
+import os, io, re, time, random, asyncio
+from datetime import datetime, timedelta, date, timezone as tz
+import requests, feedparser, pytz
+from pyrogram import Client
 
-# ——— RSS ИСТОЧНИКИ ТОЛЬКО ДЛЯ «СЕГОДНЯ» ———
+# ── Telegram creds ──────────────────────────────────────────
+API_ID   = int(os.getenv("TG_API_ID", "0"))
+API_HASH = os.getenv("TG_API_HASH", "")
+SESSION  = "sessions/astra"
+CHANNEL  = "astrapress"
+os.makedirs("sessions", exist_ok=True)
+
+# ── RSS источники (только «сегодня») ───────────────────────
 RSS_TODAY = [
-    "https://agents.media/rss",        # Агентство
-    "https://verstka.media/feed",      # Вёрстка
-    "https://www.interfax.ru/rss.asp", # Интерфакс
+    "https://agents.media/rss",
+    "https://verstka.media/feed",
+    "https://www.interfax.ru/rss.asp",
 ]
 
-HTML_RE = re.compile(r"<[^>]+>")
-HREF_RE = re.compile(r"https?://[^\s)\"'>]+")
+HTML_RE  = re.compile(r"<[^>]+>")
+ASTRA_RE = re.compile(r"\bastra\b", re.I)
+BOLD, ITAL = "bold", "italic"
 
-CACHE_TTL = 300          # 5 минут
-_cache: dict[str, dict] = {}   # key="YYYY-MM-DD" → {"ts":…, "entries":…}
+CACHE_TTL = 300  # сек
+_cache: dict[str, dict] = {}   # key → {"ts":unix, "entries":[…]}
 
-# ——— УТИЛИТЫ ————————————————————————————————————
-def _clean(txt: str) -> str:
-    return HTML_RE.sub("", txt or "").strip()
+tz_msk = pytz.timezone("Europe/Moscow")
+
+
+# ─────────── helpers ───────────────────────────────────────
+def _clean(html: str | None) -> str:
+    return HTML_RE.sub("", html or "").strip()
 
 def _iso(d: date) -> str:
     return d.isoformat()
-# ——————————————————————————————————————————————
+
+def _split_title_body(text: str, entities):
+    # ищем жирный заголовок
+    if entities:
+        for e in entities:
+            if getattr(e, "type", "") == BOLD:
+                s, epos = e.offset, e.offset + e.length
+                title = text[s:epos].strip().rstrip(".") + "."
+                body  = text[epos:].strip()
+                return title, body
+    first = text.splitlines()[0]
+    dot   = first.find(".")
+    if dot != -1:
+        return first[:dot+1].strip(), text[dot+1:].strip()
+    return first.strip(), text[len(first):].strip()
+
+def _clean_ads(text: str, entities):
+    if not entities:
+        return text
+    chars = list(text)
+    for e in entities[::-1]:
+        if getattr(e, "type", "") == ITAL and ASTRA_RE.search(text[e.offset:e.offset+e.length]):
+            for i in range(e.offset, e.offset+e.length):
+                chars[i] = ""
+    return "".join(chars).strip()
+# ───────────────────────────────────────────────────────────
 
 
-# ——— ЧТЕНИЕ RSS (СЕГОДНЯ) ————————————————
+# ─────────── RSS для сегодняшнего дня ──────────────────────
 def _load_rss_today() -> list[dict]:
-    today = dt.utcnow().date()
-    entries = []
+    today = datetime.utcnow().date()
+    out   = []
     for url in RSS_TODAY:
         try:
-            r = requests.get(url, timeout=2, headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-            feed = feedparser.parse(io.BytesIO(r.content))
+            resp = requests.get(url, timeout=3, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            feed = feedparser.parse(io.BytesIO(resp.content))
         except Exception as e:
             print("RSS_FAIL:", url, e)
             continue
 
-        for e in feed.entries:
-            pub = e.get("published_parsed") or e.get("updated_parsed")
-            if not pub or dt(*pub[:6], tzinfo=timezone.utc).date() != today:
+        for ent in feed.entries:
+            pub = ent.get("published_parsed") or ent.get("updated_parsed")
+            if not pub or datetime(*pub[:6], tzinfo=tz.utc).date() != today:
                 continue
-
-            content = (e.get("content", [{}])[0].get("value") or e.get("summary", ""))
-
-            entries.append({
-                "title":   _clean(e.get("title")),
-                "content": _clean(content),
-                "link":    e.get("link", ""),
-                "extra":   (m := HREF_RE.search(content)) and m.group(0) or ""
+            content = (ent.get("content", [{}])[0].get("value")
+                       or ent.get("summary", ""))
+            out.append({
+                "title": _clean(ent.get("title")),
+                "body":  _clean(content),
+                "kind":  "K" if not content else "F"
             })
-    return entries
-# ——————————————————————————————————————————————
+    return out
+# ───────────────────────────────────────────────────────────
 
 
-# ——— ЧТЕНИЕ MEDUZA API (ЛЮБАЯ ДАТА ≠ СЕГОДНЯ) ——  
-MEDUZA_SEARCH = "https://meduza.io/api/v3/search"
-MEDUZA_DOC    = "https://meduza.io/api/v3/{}"   # slug
+# ─────────── Astra по дате ─────────────────────────────────
+async def _astra_day_async(d: date) -> list[dict]:
+    async with Client(SESSION, api_id=API_ID, api_hash=API_HASH) as app:
+        await app.join_chat(CHANNEL)
+        start = tz_msk.localize(datetime.combine(d, datetime.min.time()))
+        end   = tz_msk.localize(datetime.combine(d, datetime.max.time()))
+        last, res = 0, []
 
-def _load_meduza(d: date) -> list[dict]:
-    """Берём 100 публикаций, фильтруем вручную по UTC+3."""
-    try:
-        res = requests.get(MEDUZA_SEARCH, params={
-            "chrono": "news",
-            "from":   d.isoformat(),
-            "to":     (d + datetime.timedelta(days=1)).isoformat(),
-            "limit":  100
-        }, timeout=4)
-        res.raise_for_status()
-        docs = res.json()["documents"]
-    except Exception as e:
-        print("MEDUZA_SEARCH_FAIL:", e)
-        return []
+        while True:
+            batch = [m async for m in app.get_chat_history(CHANNEL, offset_id=last, limit=100)]
+            if not batch:
+                break
+            for m in batch:
+                last = m.id
+                msg_dt = m.date.replace(tzinfo=pytz.UTC).astimezone(tz_msk)
+                if msg_dt < start:
+                    break
+                if not (start <= msg_dt <= end):
+                    continue
+                raw = (m.text or m.caption or "").strip()
+                if not raw:
+                    continue
+                raw = _clean_ads(raw, m.entities)
+                title, body = _split_title_body(raw, m.entities)
+                if ASTRA_RE.search(title):
+                    continue
+                res.append({"title": title, "body": body, "kind": "K" if not body else "F"})
+            else:
+                continue
+            break
+        return res
 
-    entries = []
-    for doc in docs:
-        ts = doc.get("published_at", 0) / 1000  # миллисекунды
-        local_day = dt.fromtimestamp(ts, tz=timezone.utc).astimezone(
-                    datetime.timezone(datetime.timedelta(hours=3))).date()
-        if local_day != d:
-            continue
-
-        slug = doc["id"]
-        # вытаскиваем полный текст
-        try:
-            art = requests.get(MEDUZA_DOC.format(slug), timeout=4).json()
-            body = art["root"]["content"]["body"]
-            text = " ".join(p["text"] for p in body if p.get("text"))
-        except Exception:
-            text = doc.get("description", "")
-
-        entries.append({
-            "title":   _clean(doc.get("title")),
-            "content": _clean(text),
-            "link":    f"https://meduza.io/{slug}",
-            "extra":   (m := HREF_RE.search(text)) and m.group(0) or ""
-        })
-    return entries
-# ——————————————————————————————————————————————
+def _astra_day(d: date) -> list[dict]:
+    return asyncio.run(_astra_day_async(d))
+# ───────────────────────────────────────────────────────────
 
 
-# ——— КЭШ/ОБЁРТКИ ——————————
-def _ensure(d: date):
+# ─────────── Astra по ключевому слову (последние N дней) ──
+async def _astra_kw_async(word: str, days: int = 3) -> list[dict]:
+    w_re = re.compile(rf"\b{re.escape(word)}\b", re.I)
+    limit_date = datetime.now(tz_msk) - timedelta(days=days)
+    items, last = [], 0
+    async with Client(SESSION, api_id=API_ID, api_hash=API_HASH) as app:
+        await app.join_chat(CHANNEL)
+        while True:
+            batch = [m async for m in app.get_chat_history(CHANNEL, offset_id=last, limit=100)]
+            if not batch:
+                break
+            for m in batch:
+                last = m.id
+                msg_dt = m.date.replace(tzinfo=pytz.UTC).astimezone(tz_msk)
+                if msg_dt < limit_date:
+                    return items
+                raw = (m.text or m.caption or "")
+                if not w_re.search(raw):
+                    continue
+                raw  = _clean_ads(raw, m.entities)
+                title, body = _split_title_body(raw, m.entities)
+                if ASTRA_RE.search(title):
+                    continue
+                items.append({"title": title, "body": body, "kind": "K" if not body else "F"})
+                if len(items) >= 40:
+                    return items
+            else:
+                continue
+            break
+    return items
+
+def _astra_keyword(word: str) -> list[dict]:
+    return asyncio.run(_astra_kw_async(word))
+# ───────────────────────────────────────────────────────────
+
+
+# ─────────── публичные функции ─────────────────────────────
+def today_news() -> dict | None:
+    key = "TODAY"
+    if (cached := _cache.get(key)) and time.time() - cached["ts"] < CACHE_TTL:
+        pool = cached["entries"]
+    else:
+        pool = _load_rss_today()
+        _cache[key] = {"ts": time.time(), "entries": pool}
+    return random.choice(pool) if pool else None
+
+
+def news_by_date(d: date) -> dict | None:
     key = _iso(d)
-    rec = _cache.get(key)
-    if rec and time.time() - rec["ts"] < CACHE_TTL:
-        return
-    entries = _load_rss_today() if d == dt.utcnow().date() else _load_meduza(d)
-    _cache[key] = {"ts": time.time(), "entries": entries}
-    print(f"CACHE {key}: {len(entries)} news")
+    if (c := _cache.get(key)) and time.time() - c["ts"] < CACHE_TTL:
+        pool = c["entries"]
+    else:
+        pool = _astra_day(d)
+        _cache[key] = {"ts": time.time(), "entries": pool}
+    return random.choice(pool) if pool else None
 
-def get_random_news(d: date) -> dict:
-    _ensure(d)
-    e = _cache[_iso(d)]["entries"]
-    if not e:
-        return {"title": "", "content": "", "link": "", "extra": ""}
-    return random.choice(e)
+
+def news_by_keyword(word: str) -> dict | None:
+    key = f"KW:{word.lower()}"
+    if (c := _cache.get(key)) and time.time() - c["ts"] < CACHE_TTL:
+        pool = c["entries"]
+    else:
+        pool = _astra_keyword(word)
+        _cache[key] = {"ts": time.time(), "entries": pool}
+    return random.choice(pool) if pool else None

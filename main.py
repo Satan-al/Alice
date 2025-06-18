@@ -1,154 +1,148 @@
 from datetime import datetime, timedelta, date
+import re
 from flask import Flask, request, jsonify
-from news_fetcher import get_random_news
+from news_fetcher import today_news, news_by_date, news_by_keyword
 
 app = Flask(__name__)
 MAX_LEN = 950
-session_state: dict[str, dict] = {}
+state: dict[str, dict] = {}
 
-# ——— Пропись дат
-NUM_WORDS = {
-    1: "первого", 2: "второго", 3: "третьего", 4: "четвёртого", 5: "пятого",
-    6: "шестого", 7: "седьмого", 8: "восьмого", 9: "девятого", 10: "десятого",
-    11: "одиннадцатого", 12: "двенадцатого", 13: "тринадцатого", 14: "четырнадцатого",
-    15: "пятнадцатого", 16: "шестнадцатого", 17: "семнадцатого", 18: "восемнадцатого",
-    19: "девятнадцатого", 20: "двадцатого", 21: "двадцать первого", 22: "двадцать второго",
-    23: "двадцать третьего", 24: "двадцать четвёртого", 25: "двадцать пятого",
-    26: "двадцать шестого", 27: "двадцать седьмого", 28: "двадцать восьмого",
-    29: "двадцать девятого", 30: "тридцатого", 31: "тридцать первого"
-}
-MONTHS = {
-    1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
-    7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
-}
-YEARS = {
-    2020: "две тысячи двадцатого", 2021: "две тысячи двадцать первого",
-    2022: "две тысячи двадцать второго", 2023: "две тысячи двадцать третьего",
-    2024: "две тысячи двадцать четвёртого", 2025: "две тысячи двадцать пятого"
-}
-def human_date(d: date) -> str:
-    return f"{NUM_WORDS[d.day]} {MONTHS[d.month]} {YEARS.get(d.year, str(d.year))} года"
+# ───── пропись дат ─────────────────────────────────────────
+NUM = {1:"первого",2:"второго",3:"третьего",4:"четвёртого",5:"пятого",
+       6:"шестого",7:"седьмого",8:"восьмого",9:"девятого",10:"десятого",
+       11:"одиннадцатого",12:"двенадцатого",13:"тринадцатого",14:"четырнадцатого",
+       15:"пятнадцатого",16:"шестнадцатого",17:"семнадцатого",18:"восемнадцатого",
+       19:"девятнадцатого",20:"двадцатого",21:"двадцать первого",22:"двадцать второго",
+       23:"двадцать третьего",24:"двадцать четвёртого",25:"двадцать пятого",
+       26:"двадцать шестого",27:"двадцать седьмого",28:"двадцать восьмого",
+       29:"двадцать девятого",30:"тридцатого",31:"тридцать первого"}
+MON = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
+       7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
+YR  = {2024:"две тысячи двадцать четвёртого",
+       2025:"две тысячи двадцать пятого"}
+def human(d: date)->str: return f"{NUM[d.day]} {MON[d.month]} {YR.get(d.year,str(d.year))} года"
+# ───────────────────────────────────────────────────────────
 
+def ok(text:str): 
+    return jsonify({"response":{"text":text,"end_session":False},"version":"1.0"})
 
-# ——— Вспомогательные
-def ok(text: str):
-    return jsonify({"response": {"text": text, "end_session": False}, "version": "1.0"})
+def chunk(t:str):
+    if len(t)<=MAX_LEN: return t.strip(),""
+    cut=t[:MAX_LEN]; end=cut.rfind("."); 
+    end=end if end!=-1 else cut.rfind(" ")
+    return cut[:end+1].strip(), t[end+1:].lstrip()
 
-def chunk(txt: str):
-    if len(txt) <= MAX_LEN:
-        return txt.strip(), ""
-    cut = txt[:MAX_LEN]
-    end = cut.rfind(".")
-    if end == -1: end = cut.rfind(" ")
-    return cut[:end+1].strip(), txt[end+1:].lstrip()
-
-def parse_date(req) -> tuple[bool, date]:
-    ent = req["request"]["nlu"].get("entities", [])
-    today = datetime.utcnow().date()
+# ───── разбор даты ─────────────────────────────────────────
+def parse_date(req)->tuple[bool,date|None]:
+    ent=req["request"]["nlu"].get("entities",[])
+    today=datetime.utcnow().date()
     for e in ent:
-        if e["type"] != "YANDEX.DATETIME": continue
-        v = e["value"]
+        if e["type"]!="YANDEX.DATETIME": continue
+        v=e["value"]
         if v.get("day_is_relative"):
-            d = today + timedelta(days=int(v["day"]))
-            return d > today, d
-        d, m, y = v.get("day"), v.get("month"), v.get("year")
+            d= today+timedelta(days=int(v["day"]))
+            return d>today,d
+        d,m,y=v.get("day"),v.get("month"),v.get("year")
         if d and m:
             if y is None:
-                d_ = date(today.year, m, d)
-                if d_ > today:
-                    d_ = date(today.year - 1, m, d)
-            else:
-                d_ = date(y, m, d)
-            return d_ > today, d_
-    return False, today
+                d_=date(today.year,m,d)
+                if d_>today: d_=date(today.year-1,m,d)
+            else: d_=date(y,m,d)
+            return d_>today,d_
+    return False,None
+# ───── ключевое слово (первое без цифр) ────────────────────
+def extract_kw(utt:str)->str|None:
+    for w in re.findall(r"[а-яёa-zA-Z\-]+",utt.lower()):
+        if not any(ch.isdigit() for ch in w):
+            return w
+    return None
+# ───────────────────────────────────────────────────────────
 
+@app.route("/",methods=["GET"])
+def ping(): return "ok",200
 
-# ——— Методы
-@app.route("/", methods=["GET"])
-def ping():
-    return "ok", 200
-
-@app.route("/", methods=["POST"])
+@app.route("/",methods=["POST"])
 def webhook():
     try:
-        req = request.get_json(force=True)
-        sid = req["session"]["session_id"]
-        utt = req["request"]["original_utterance"].lower().strip()
-        is_new = req["session"]["new"]
+        req=request.get_json(force=True)
+        sid=req["session"]["session_id"]
+        utt=req["request"]["original_utterance"].lower()
+        if req["session"]["new"]:
+            state[sid]={"stage":"await"}
+            return ok("Привет! Назови дату или слово — я зачитаю одну новость.")
+        
+        st=state.get(sid,{"stage":"await"})
+        if st["stage"]=="await":
+            future,dt=parse_date(req)
+            kw=extract_kw(utt)
+            today=datetime.utcnow().date()
 
-        if is_new:
-            session_state[sid] = {"stage": "await"}
-            return ok("Привет! Назови дату — сегодня, вчера, или например шестнадцатое мая.")
+            # ―― выбираем источник
+            if kw and not dt:
+                post=news_by_keyword(kw)
+                if not post: return ok(f"Свежих новостей со словом «{kw}» нет.")
+            elif dt:
+                if future: return ok("Будущие новости мы не предсказываем 😉")
+                if kw:
+                    pool=[]
+                    daily=news_by_date(dt)
+                    if daily and kw.lower() in (daily["title"]+daily["body"]).lower():
+                        pool=[daily]
+                    if not pool:
+                        return ok(f"За {human(dt)} новостей со словом «{kw}» нет.")
+                    post=random.choice(pool)
+                else:
+                    post=news_by_date(dt) if dt!=today else today_news()
+                    if not post: return ok(f"За {human(dt)} у меня нет публикаций.")
+            else:
+                post=today_news()
+                if not post: return ok("За сегодня новостей пока нет.")
 
-        state = session_state.get(sid, {"stage": "await"})
-        stage = state["stage"]
+            state[sid]={"stage":"detail","post":post}
+            if post["kind"]=="K":
+                state[sid]["stage"]="more"
+                return ok(f"{post['title']} Хотите ещё новость?")
+            return ok(f"{post['title']} Хотите узнать подробнее?")
 
-        if stage == "await":
-            future, dt_req = parse_date(req)
-            if future:
-                return ok("Мы честные: будущие новости не рассказываем. Это же не выборы в России.")
-            news = get_random_news(dt_req)
-            if not news["title"]:
-                return ok(f"За {human_date(dt_req)} у меня нет публикаций.")
-            session_state[sid] = {"stage": "detail", "news": news, "date": dt_req}
-            return ok(f"{news['title'].rstrip('.')}. Хотите узнать подробнее?")
-
-        if stage == "detail":
+        if st["stage"]=="detail":
             if "да" in utt:
-                news = state["news"]
-                head, tail = chunk(news["content"])
+                head,tail=chunk(st["post"]["body"])
                 if tail:
-                    session_state[sid] = {"stage": "cont", "remain": tail, "extra": news["extra"], "date": state["date"]}
+                    state[sid]={"stage":"cont","remain":tail}
                     return ok(f"{head} Продолжить?")
-                if news["extra"]:
-                    session_state[sid] = {"stage": "extra", "extra": news["extra"], "date": state["date"]}
-                    return ok(f"{head} Хотите узнать и об этом?")
-                session_state[sid]["stage"] = "more"
+                state[sid]={"stage":"more"}
                 return ok(f"{head} Хотите ещё новость?")
             if "нет" in utt:
-                new = get_random_news(state["date"])
-                session_state[sid] = {"stage": "detail", "news": new, "date": state["date"]}
-                return ok(f"Тогда вот ещё: {new['title'].rstrip('.')}. Хотите узнать подробнее?")
-            return ok("Скажи «да» или «нет», пожалуйста.")
-
-        if stage == "cont":
-            if "да" in utt:
-                head, tail = chunk(state["remain"])
-                if tail:
-                    session_state[sid]["remain"] = tail
-                    return ok(f"{head} Продолжить?")
-                if state.get("extra"):
-                    session_state[sid] = {"stage": "extra", "extra": state["extra"], "date": state["date"]}
-                    return ok(f"{head} Хотите узнать и об этом?")
-                session_state[sid]["stage"] = "more"
-                return ok(f"{head} Хотите ещё новость?")
-            if "нет" in utt:
-                session_state[sid]["stage"] = "more"
+                state[sid]={"stage":"more"}
                 return ok("Окей. Хотите следующую новость?")
             return ok("Скажи «да» или «нет», пожалуйста.")
 
-        if stage == "extra":
+        if st["stage"]=="cont":
             if "да" in utt:
-                extra = get_random_news(datetime.utcnow().date())
-                head, _ = chunk(extra["content"])
-                session_state[sid]["stage"] = "more"
-                return ok(f"{extra['title'].rstrip('.')}. {head} Хотите ещё новость?")
+                head,tail=chunk(st["remain"])
+                if tail:
+                    st["remain"]=tail
+                    return ok(f"{head} Продолжить?")
+                state[sid]={"stage":"more"}
+                return ok(f"{head} Хотите ещё новость?")
             if "нет" in utt:
-                session_state[sid]["stage"] = "more"
+                state[sid]={"stage":"more"}
                 return ok("Окей. Хотите следующую новость?")
             return ok("Скажи «да» или «нет», пожалуйста.")
 
-        if stage == "more":
+        if st["stage"]=="more":
             if "да" in utt:
-                new = get_random_news(state["date"])
-                session_state[sid] = {"stage": "detail", "news": new, "date": state["date"]}
-                return ok(f"{new['title'].rstrip('.')}. Хотите узнать подробнее?")
+                state[sid]={"stage":"await"}  # запрашиваем новое слово/дату
+                return ok("Назови дату или слово.")
             if "нет" in utt:
-                session_state[sid]["stage"] = "await"
-                return ok("Хорошо. Скажи дату, если захочешь ещё.")
+                state[sid]={"stage":"await"}
+                return ok("Хорошо. Если захочешь ещё — просто скажи.")
             return ok("Скажи «да» или «нет», пожалуйста.")
-
+        
         return ok("Не понял. Попробуй ещё раз.")
     except Exception as e:
-        print("ERR:", e)
-        return ok("Что-то пошло не так. Попробуйте позже.")
+        print("ERR:",e)
+        return ok("Что-то сломалось. Попробуйте позже.")
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=5000,debug=True)
