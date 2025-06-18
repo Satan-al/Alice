@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, date
+import os
 import re
 import random               # ← добавь эту строку
 from flask import Flask, request, jsonify
