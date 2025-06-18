@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, date
 import re
+import random               # ← добавь эту строку
 from flask import Flask, request, jsonify
 from news_fetcher import today_news, news_by_date, news_by_keyword
 
